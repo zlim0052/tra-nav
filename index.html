@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Simple Device Tracker – Local Friendly</title>
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
+  <title>Simple Device Tracker – with Traffic Lights</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="" />
   <style>
     html, body { height: 100%; margin: 0; font-family: system-ui, sans-serif; }
     #map { height: calc(100% - 112px); background: #f3f4f6; }
@@ -25,6 +25,7 @@
     <button id="followBtn" class="secondary" title="Toggle follow mode">Follow: off</button>
     <button id="locateBtn" class="secondary" title="Center the map on the latest point">Center on me</button>
     <button id="demoBtn" class="secondary" title="Simulate GPS if permission is denied">Demo mode</button>
+    <button id="lightsBtn" class="secondary" title="Show mapped traffic signals from OpenStreetMap">Traffic lights: off</button>
     <span id="status" class="pill">idle</span>
     <div class="spacer"></div>
     <span class="stats">Points: <span id="ptCount">0</span> · Last fix: <span id="lastFix">—</span> · Perm: <span id="permState">?</span></span>
@@ -43,6 +44,7 @@
     const followBtn = $('followBtn');
     const locateBtn = $('locateBtn');
     const demoBtn = $('demoBtn');
+    const lightsBtn = $('lightsBtn');
     const testBtn = $('testBtn');
     const statusEl = $('status');
     const ptCountEl = $('ptCount');
@@ -50,21 +52,6 @@
     const permStateEl = $('permState');
     const downloadBtn = $('downloadBtn');
     const testLog = $('testLog');
-    const isIOS = /iP(hone|ad|od)/i.test(navigator.userAgent);
-    const isAndroid = /Android/i.test(navigator.userAgent);
-
-    function showPermissionHelp() {
-        const help = [
-            isIOS
-            ? 'iOS: Settings → Privacy & Security → Location Services → Safari (or Chrome) → While Using + Precise Location ON. In Safari, tap aA → Website Settings → Location → Allow.'
-            : 'Android: Chrome → Settings → Site settings → Location → Allowed. Then open the page, tap the lock icon → Permissions → Location → Allow. If previously blocked: Settings → Site settings → All sites → [your tunnel host] → Clear & reset.',
-            'Open the HTTPS link in the system browser (Safari/Chrome), not an in-app browser (e.g., WhatsApp/Instagram).'
-        ].join('\n');
-        log(help, 'error');
-        setStatus('Location permission blocked at OS/browser level. See console help.', '#fee2e2');
-        }
-
-
 
     function setStatus(text, color) { statusEl.textContent = text; statusEl.style.background = color || '#f3f4f6'; }
     function log(msg, type = 'info') {
@@ -77,7 +64,7 @@
 
     // ---------- Map init ----------
     const map = L.map('map');
-    // Carto Voyager tends to be reliable and fast; if blocked by a network/extension, swap to OSM tiles below.
+    // Base map
     const tiles = L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
       attribution: '&copy; <a href="https://www.openstreetmap.org/">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/">CARTO</a>',
       subdomains: 'abcd', maxZoom: 20
@@ -87,7 +74,7 @@
     let tileErrorCount = 0;
     tiles.on('tileerror', () => {
       tileErrorCount++;
-      if (tileErrorCount === 6) { // switch after a few failures
+      if (tileErrorCount === 6) {
         log('Switching to OSM tile server due to tile load errors', 'error');
         map.removeLayer(tiles);
         L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -102,15 +89,16 @@
     const pathLine = L.polyline([], { weight: 4, opacity: 0.9, color: '#10b981' }).addTo(map);
     let marker = null, accuracyCircle = null;
 
+    // Traffic lights overlay
+    let lightsOn = false;
+    const lightsLayer = L.layerGroup().addTo(map);
+
     // ---------- State ----------
     let watchId = null, demoTimer = null, follow = false;
     const points = [];
 
-    // ---------- Permissions/HTTPS tips ----------
+    // ---------- Permissions preflight ----------
     async function preflight() {
-      if (!window.isSecureContext && location.hostname !== 'localhost') {
-        setStatus('⚠️ Tip: run from https:// or http://localhost for live GPS', '#fde68a');
-      }
       if (navigator.permissions && navigator.permissions.query) {
         try {
           const res = await navigator.permissions.query({ name: 'geolocation' });
@@ -160,7 +148,7 @@
       if (!accuracyCircle) accuracyCircle = L.circle(ll, { radius: acc || 0, color: '#2563eb', weight: 1 }).addTo(map);
       else { accuracyCircle.setLatLng(ll).setRadius(acc || 0); }
 
-      if (follow) map.setView(ll); // only recenter when follow mode is ON
+      if (follow) map.setView(ll);
       setStatus('tracking', '#d1fae5');
       downloadBtn.disabled = points.length === 0;
     }
@@ -169,48 +157,78 @@
       const { latitude, longitude, accuracy, heading, speed } = pos.coords;
       handleFix(latitude, longitude, accuracy, speed, heading, pos.timestamp);
     }
+
     function onPositionError(err) {
-    const msg = explainGeoError(err);
-    setStatus(msg, '#fee2e2');
-    log(`Error: ${msg}`, 'error');
-
-    // If the browser reports permission denied, print OS-specific instructions
-    if (err && err.code === 1) showPermissionHelp();
-
-    // If the page is insecure OR permission denied, auto-fallback to Demo so the UI keeps working
-    const insecure = !window.isSecureContext && location.hostname !== 'localhost';
-    if ((insecure || (err && err.code === 1)) && !demoTimer) {
-        startDemo();
+      const msg = explainGeoError(err);
+      setStatus(msg, '#fee2e2');
+      log(`Error: ${msg}`, 'error');
     }
-    }
-
 
     function startTracking() {
-      if (!navigator.geolocation) { setStatus('Geolocation not supported.', '#fee2e2'); return; }
-      stopDemo(); resetTrack();
-      navigator.geolocation.getCurrentPosition(onPositionSuccess, onPositionError, { enableHighAccuracy: true, timeout: 15000 });
-      watchId = navigator.geolocation.watchPosition(onPositionSuccess, onPositionError, { enableHighAccuracy: true, maximumAge: 5000, timeout: 20000 });
+      if (!('geolocation' in navigator)) { setStatus('Geolocation not supported by this browser.', '#fee2e2'); return; }
+      resetTrack();
       startBtn.disabled = true; stopBtn.disabled = false;
+
+      const optsOnce = { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 };
+      const optsWatch = { enableHighAccuracy: true, maximumAge: 5000, timeout: 20000 };
+
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          onPositionSuccess(pos);
+          watchId = navigator.geolocation.watchPosition(onPositionSuccess, onPositionError, optsWatch);
+          setStatus('tracking…', '#e0e7ff');
+        },
+        (err) => {
+          onPositionError(err);
+          startBtn.disabled = false; stopBtn.disabled = true;
+        },
+        optsOnce
+      );
     }
+
     function stopTracking() {
       if (watchId) navigator.geolocation.clearWatch(watchId); watchId = null;
       setStatus('stopped', '#fef3c7'); startBtn.disabled = false; stopBtn.disabled = true;
     }
 
-    // ---------- Controls ----------
-    followBtn.addEventListener('click', () => { follow = !follow; followBtn.textContent = `Follow: ${follow ? 'on' : 'off'}`; });
-    locateBtn.addEventListener('click', () => {
-      if (points.length) { const p = points[points.length - 1]; map.setView([p.lat, p.lon], Math.max(map.getZoom(), 16)); }
-    });
-
-    // ---------- Demo mode ----------
-    function startDemo() {
-      stopTracking(); resetTrack(); setStatus('demo mode', '#cffafe');
-      const path = [ [3.139,101.6869],[3.141,101.6880],[3.143,101.6895],[3.145,101.6880],[3.145,101.6860],[3.143,101.6840],[3.141,101.6830],[3.139,101.6845] ];
-      let i = 0; demoTimer = setInterval(() => { const [lat, lon] = path[i % path.length]; handleFix(lat, lon, 8, 0, 0, Date.now()); i++; }, 1000);
-      demoBtn.textContent = 'Stop demo';
+    // ---------- Traffic lights (OSM via Overpass) ----------
+    async function fetchTrafficLights() {
+      if (!lightsOn) return;
+      lightsLayer.clearLayers();
+      const b = map.getBounds();
+      const s = b.getSouth(), w = b.getWest(), n = b.getNorth(), e = b.getEast();
+      const q = `
+[out:json][timeout:25];
+node["highway"="traffic_signals"](${s},${w},${n},${e});
+out body;`;
+      try {
+        setStatus('Loading traffic lights…', '#e0e7ff');
+        const res = await fetch('https://overpass-api.de/api/interpreter', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+          body: 'data=' + encodeURIComponent(q)
+        });
+        const data = await res.json();
+        const nodes = (data.elements || []).filter(el => el.type === 'node');
+        for (const n of nodes) {
+          L.circleMarker([n.lat, n.lon], { radius: 5, color: '#ef4444', weight: 2, fillColor: '#ef4444', fillOpacity: 0.9 })
+            .addTo(lightsLayer)
+            .bindPopup('Traffic signal');
+        }
+        setStatus(`Traffic lights loaded: ${nodes.length}`, '#d1fae5');
+      } catch (e) {
+        log('Traffic lights fetch failed: ' + (e && e.message ? e.message : e), 'error');
+        setStatus('Failed to load traffic lights', '#fee2e2');
+      }
     }
-    function stopDemo() { if (demoTimer) clearInterval(demoTimer); demoTimer = null; demoBtn.textContent = 'Demo mode'; }
+
+    function toggleTrafficLights() {
+      lightsOn = !lightsOn;
+      lightsBtn.textContent = `Traffic lights: ${lightsOn ? 'on' : 'off'}`;
+      if (lightsOn) fetchTrafficLights(); else lightsLayer.clearLayers();
+    }
+
+    map.on('moveend', () => { if (lightsOn) fetchTrafficLights(); });
 
     // ---------- Export ----------
     function exportJSON() {
@@ -228,11 +246,24 @@
       log('Tests done.');
     }
 
+    // ---------- Demo mode ----------
+    function startDemo() {
+      stopTracking(); resetTrack(); setStatus('demo mode', '#cffafe');
+      const path = [ [3.139,101.6869],[3.141,101.6880],[3.143,101.6895],[3.145,101.6880],[3.145,101.6860],[3.143,101.6840],[3.141,101.6830],[3.139,101.6845] ];
+      let i = 0; demoTimer = setInterval(() => { const [lat, lon] = path[i % path.length]; handleFix(lat, lon, 8, 0, 0, Date.now()); i++; }, 1000);
+      demoBtn.textContent = 'Stop demo';
+    }
+    function stopDemo() { if (demoTimer) clearInterval(demoTimer); demoTimer = null; demoBtn.textContent = 'Demo mode'; }
+
+    // ---------- Event wiring ----------
     downloadBtn.addEventListener('click', exportJSON);
     startBtn.addEventListener('click', startTracking);
     stopBtn.addEventListener('click', stopTracking);
     demoBtn.addEventListener('click', () => demoTimer ? stopDemo() : startDemo());
     testBtn.addEventListener('click', runSelfTests);
+    followBtn.addEventListener('click', () => { follow = !follow; followBtn.textContent = `Follow: ${follow ? 'on' : 'off'}`; });
+    locateBtn.addEventListener('click', () => { if (points.length) { const p = points[points.length - 1]; map.setView([p.lat, p.lon], Math.max(map.getZoom(), 16)); } });
+    lightsBtn.addEventListener('click', toggleTrafficLights);
 
     preflight();
   </script>
