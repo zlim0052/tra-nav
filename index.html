@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Simple Device Tracker – Local Friendly</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
+  <style>
+    html, body { height: 100%; margin: 0; font-family: system-ui, sans-serif; }
+    #map { height: calc(100% - 112px); background: #f3f4f6; }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 10px; border-bottom: 1px solid #e5e7eb; background: #fff; position: sticky; top: 0; z-index: 1000; }
+    button { padding: 8px 12px; border-radius: 10px; border: 1px solid #d1d5db; background: #111827; color: #fff; cursor: pointer; }
+    button.secondary { background: #fff; color: #111; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .pill { padding: 6px 10px; border-radius: 999px; background: #f3f4f6; font-size: 12px; color: #111827; white-space: nowrap; }
+    .stats { font-size: 12px; color: #374151; }
+    .spacer { flex: 1; }
+    #testLog { max-height: 140px; overflow: auto; font-family: monospace; font-size: 12px; padding: 8px 10px; background: #f9fafb; border-top: 1px solid #eee; }
+  </style>
+</head>
+<body>
+  <div class="toolbar">
+    <button id="startBtn">Start tracking</button>
+    <button id="stopBtn" class="secondary" disabled>Stop</button>
+    <button id="followBtn" class="secondary" title="Toggle follow mode">Follow: off</button>
+    <button id="locateBtn" class="secondary" title="Center the map on the latest point">Center on me</button>
+    <button id="demoBtn" class="secondary" title="Simulate GPS if permission is denied">Demo mode</button>
+    <span id="status" class="pill">idle</span>
+    <div class="spacer"></div>
+    <span class="stats">Points: <span id="ptCount">0</span> · Last fix: <span id="lastFix">—</span> · Perm: <span id="permState">?</span></span>
+    <button id="downloadBtn" class="secondary" disabled>Download JSON</button>
+    <button id="testBtn" class="secondary">Run self‑tests</button>
+  </div>
+  <div id="map"></div>
+  <div id="testLog" aria-live="polite"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+  <script>
+    // ---------- UI helpers ----------
+    const $ = (id) => document.getElementById(id);
+    const startBtn = $('startBtn');
+    const stopBtn = $('stopBtn');
+    const followBtn = $('followBtn');
+    const locateBtn = $('locateBtn');
+    const demoBtn = $('demoBtn');
+    const testBtn = $('testBtn');
+    const statusEl = $('status');
+    const ptCountEl = $('ptCount');
+    const lastFixEl = $('lastFix');
+    const permStateEl = $('permState');
+    const downloadBtn = $('downloadBtn');
+    const testLog = $('testLog');
+    const isIOS = /iP(hone|ad|od)/i.test(navigator.userAgent);
+    const isAndroid = /Android/i.test(navigator.userAgent);
+
+    function showPermissionHelp() {
+        const help = [
+            isIOS
+            ? 'iOS: Settings → Privacy & Security → Location Services → Safari (or Chrome) → While Using + Precise Location ON. In Safari, tap aA → Website Settings → Location → Allow.'
+            : 'Android: Chrome → Settings → Site settings → Location → Allowed. Then open the page, tap the lock icon → Permissions → Location → Allow. If previously blocked: Settings → Site settings → All sites → [your tunnel host] → Clear & reset.',
+            'Open the HTTPS link in the system browser (Safari/Chrome), not an in-app browser (e.g., WhatsApp/Instagram).'
+        ].join('\n');
+        log(help, 'error');
+        setStatus('Location permission blocked at OS/browser level. See console help.', '#fee2e2');
+        }
+
+
+
+    function setStatus(text, color) { statusEl.textContent = text; statusEl.style.background = color || '#f3f4f6'; }
+    function log(msg, type = 'info') {
+      const p = document.createElement('div');
+      p.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      if (type === 'error') p.style.color = '#b91c1c';
+      if (type === 'ok') p.style.color = '#065f46';
+      testLog.prepend(p);
+    }
+
+    // ---------- Map init ----------
+    const map = L.map('map');
+    // Carto Voyager tends to be reliable and fast; if blocked by a network/extension, swap to OSM tiles below.
+    const tiles = L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
+      attribution: '&copy; <a href="https://www.openstreetmap.org/">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/">CARTO</a>',
+      subdomains: 'abcd', maxZoom: 20
+    }).addTo(map);
+
+    // Fallback handler: if a tile fails repeatedly, switch to OSM tiles.
+    let tileErrorCount = 0;
+    tiles.on('tileerror', () => {
+      tileErrorCount++;
+      if (tileErrorCount === 6) { // switch after a few failures
+        log('Switching to OSM tile server due to tile load errors', 'error');
+        map.removeLayer(tiles);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          maxZoom: 19,
+          attribution: '&copy; OpenStreetMap contributors'
+        }).addTo(map);
+      }
+    });
+
+    map.setView([3.139, 101.6869], 14);
+
+    const pathLine = L.polyline([], { weight: 4, opacity: 0.9, color: '#10b981' }).addTo(map);
+    let marker = null, accuracyCircle = null;
+
+    // ---------- State ----------
+    let watchId = null, demoTimer = null, follow = false;
+    const points = [];
+
+    // ---------- Permissions/HTTPS tips ----------
+    async function preflight() {
+      if (!window.isSecureContext && location.hostname !== 'localhost') {
+        setStatus('⚠️ Tip: run from https:// or http://localhost for live GPS', '#fde68a');
+      }
+      if (navigator.permissions && navigator.permissions.query) {
+        try {
+          const res = await navigator.permissions.query({ name: 'geolocation' });
+          permStateEl.textContent = res.state;
+          res.onchange = () => { permStateEl.textContent = res.state; };
+        } catch { permStateEl.textContent = 'unknown'; }
+      }
+    }
+
+    function explainGeoError(err) {
+      switch (err.code) {
+        case 1: return 'Permission denied. Allow access in site settings or use Demo mode.';
+        case 2: return 'Position unavailable. Move to open area or use Wi‑Fi.';
+        case 3: return 'Request timed out. Try again.';
+        default: return 'Geolocation error.';
+      }
+    }
+
+    // ---------- Tracking logic ----------
+    function resetTrack() {
+      pathLine.setLatLngs([]);
+      if (marker) { marker.remove(); marker = null; }
+      if (accuracyCircle) { accuracyCircle.remove(); accuracyCircle = null; }
+      points.length = 0; ptCountEl.textContent = '0'; lastFixEl.textContent = '—';
+      downloadBtn.disabled = true;
+    }
+
+    function handleFix(lat, lon, acc, speed, heading, ts) {
+      const t = new Date(ts).toISOString();
+      points.push({ t, lat, lon, acc, speed, heading });
+      ptCountEl.textContent = String(points.length);
+      lastFixEl.textContent = new Date(ts).toLocaleTimeString();
+
+      const ll = [lat, lon];
+      pathLine.addLatLng(ll);
+
+      // Blue dot user marker
+      if (!marker) {
+        const userIcon = L.divIcon({
+          className: 'user-marker',
+          html: '<div style="width:18px;height:18px;background:#2563eb;border-radius:50%;border:3px solid white;box-shadow:0 0 0 2px rgba(37,99,235,.35);"></div>',
+          iconSize: [18, 18], iconAnchor: [9, 9]
+        });
+        marker = L.marker(ll, { icon: userIcon }).addTo(map).bindPopup('You are here');
+      } else { marker.setLatLng(ll); }
+
+      if (!accuracyCircle) accuracyCircle = L.circle(ll, { radius: acc || 0, color: '#2563eb', weight: 1 }).addTo(map);
+      else { accuracyCircle.setLatLng(ll).setRadius(acc || 0); }
+
+      if (follow) map.setView(ll); // only recenter when follow mode is ON
+      setStatus('tracking', '#d1fae5');
+      downloadBtn.disabled = points.length === 0;
+    }
+
+    function onPositionSuccess(pos) {
+      const { latitude, longitude, accuracy, heading, speed } = pos.coords;
+      handleFix(latitude, longitude, accuracy, speed, heading, pos.timestamp);
+    }
+    function onPositionError(err) {
+    const msg = explainGeoError(err);
+    setStatus(msg, '#fee2e2');
+    log(`Error: ${msg}`, 'error');
+
+    // If the browser reports permission denied, print OS-specific instructions
+    if (err && err.code === 1) showPermissionHelp();
+
+    // If the page is insecure OR permission denied, auto-fallback to Demo so the UI keeps working
+    const insecure = !window.isSecureContext && location.hostname !== 'localhost';
+    if ((insecure || (err && err.code === 1)) && !demoTimer) {
+        startDemo();
+    }
+    }
+
+
+    function startTracking() {
+      if (!navigator.geolocation) { setStatus('Geolocation not supported.', '#fee2e2'); return; }
+      stopDemo(); resetTrack();
+      navigator.geolocation.getCurrentPosition(onPositionSuccess, onPositionError, { enableHighAccuracy: true, timeout: 15000 });
+      watchId = navigator.geolocation.watchPosition(onPositionSuccess, onPositionError, { enableHighAccuracy: true, maximumAge: 5000, timeout: 20000 });
+      startBtn.disabled = true; stopBtn.disabled = false;
+    }
+    function stopTracking() {
+      if (watchId) navigator.geolocation.clearWatch(watchId); watchId = null;
+      setStatus('stopped', '#fef3c7'); startBtn.disabled = false; stopBtn.disabled = true;
+    }
+
+    // ---------- Controls ----------
+    followBtn.addEventListener('click', () => { follow = !follow; followBtn.textContent = `Follow: ${follow ? 'on' : 'off'}`; });
+    locateBtn.addEventListener('click', () => {
+      if (points.length) { const p = points[points.length - 1]; map.setView([p.lat, p.lon], Math.max(map.getZoom(), 16)); }
+    });
+
+    // ---------- Demo mode ----------
+    function startDemo() {
+      stopTracking(); resetTrack(); setStatus('demo mode', '#cffafe');
+      const path = [ [3.139,101.6869],[3.141,101.6880],[3.143,101.6895],[3.145,101.6880],[3.145,101.6860],[3.143,101.6840],[3.141,101.6830],[3.139,101.6845] ];
+      let i = 0; demoTimer = setInterval(() => { const [lat, lon] = path[i % path.length]; handleFix(lat, lon, 8, 0, 0, Date.now()); i++; }, 1000);
+      demoBtn.textContent = 'Stop demo';
+    }
+    function stopDemo() { if (demoTimer) clearInterval(demoTimer); demoTimer = null; demoBtn.textContent = 'Demo mode'; }
+
+    // ---------- Export ----------
+    function exportJSON() {
+      const blob = new Blob([JSON.stringify({ points }, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob); const a = document.createElement('a');
+      a.href = url; a.download = `track_${Date.now()}.json`; a.click(); URL.revokeObjectURL(url);
+    }
+
+    // ---------- Self tests ----------
+    async function runSelfTests() {
+      log('Running tests…');
+      try { if (!map || typeof map.getCenter !== 'function') throw new Error('Map not initialized'); log('Map initialized ✓', 'ok'); } catch (e) { log(e.message, 'error'); }
+      try { startDemo(); const p0 = points.length; await new Promise(r=>setTimeout(r, 2200)); const p1 = points.length; if (p1<=p0) throw new Error('Demo produced no points'); log('Demo emits points ✓', 'ok'); stopDemo(); } catch (e) { log(e.message, 'error'); stopDemo(); }
+      try { if (!points.length) handleFix(3.139,101.6869,10,0,0,Date.now()); const payload = JSON.stringify({ points }); if (payload.length < 20) throw new Error('Export payload too small'); log('Export payload ✓', 'ok'); } catch (e) { log(e.message, 'error'); }
+      log('Tests done.');
+    }
+
+    downloadBtn.addEventListener('click', exportJSON);
+    startBtn.addEventListener('click', startTracking);
+    stopBtn.addEventListener('click', stopTracking);
+    demoBtn.addEventListener('click', () => demoTimer ? stopDemo() : startDemo());
+    testBtn.addEventListener('click', runSelfTests);
+
+    preflight();
+  </script>
+</body>
+</html>
